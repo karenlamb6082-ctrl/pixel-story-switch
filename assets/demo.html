@@ -1,0 +1,853 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" href="data:,">
+  <title>窗里 · 雨夜</title>
+  <style>
+    :root { --night: 0%; --lamp: 0; background: #d7e3e8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; overflow: hidden; }
+    main {
+      display: grid; grid-template-columns: minmax(0, 1fr); place-items: center;
+      min-height: 100vh; min-height: 100svh;
+      background:
+        radial-gradient(ellipse at 36% 27%, color-mix(in oklab, #f0f5f4, #232e4b var(--night)), transparent 74%),
+        color-mix(in oklab, #c4d3dc, #0c1022 var(--night));
+    }
+    .stage {
+      width: min(78vw, 865px, 152svh); aspect-ratio: 276 / 145;
+      position: relative; isolation: isolate;
+    }
+    .stage::before {
+      position: absolute; content: ""; z-index: -1; inset: 15% 22% 6% 10%;
+      background: radial-gradient(ellipse at 49% 48%, #f4a94b4d, #c77c3c13 37%, transparent 69%);
+      opacity: var(--lamp); pointer-events: none;
+    }
+    canvas { width: 100%; height: 100%; display: block; position: absolute; inset: 0; pointer-events: none; }
+    canvas[hidden] { display: none; }
+    button {
+      position: absolute; inset: 13.45% 7.246%; border: 0; border-radius: 999px;
+      background: transparent; padding: 0; cursor: grab; touch-action: none;
+      user-select: none; -webkit-tap-highlight-color: transparent;
+    }
+    button:active { cursor: grabbing; }
+    button:focus-visible { outline: 2px solid #8a97bb; outline-offset: 7px; }
+    @media (max-width: 600px) { .stage { width: min(108vw, 152svh); } }
+  </style>
+</head>
+<body>
+  <main data-screen-label="雨夜">
+    <div class="stage">
+      <canvas id="view" aria-hidden="true"></canvas>
+      <canvas id="fallback" aria-hidden="true" hidden></canvas>
+      <button id="switch" type="button" role="switch" aria-checked="false" aria-label="睡眠模式" aria-description="向右拖到雨夜入睡，向左拖回白天。也可以点击或使用方向键切换"></button>
+    </div>
+  </main>
+  <!-- Interaction study inspired by Ian: https://x.com/ianneo_ai/status/2119712336558878871 -->
+  <script>
+    "use strict";
+
+    const view = document.querySelector("#view");
+    const fallback = document.querySelector("#fallback");
+    const control = document.querySelector("#switch");
+    const root = document.documentElement;
+    const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+    const frameWidth = 276;
+    const trackRadius = 53;
+    const apertureRadius = 48.8;
+    const lensTravel = 65;
+    const room = Object.assign(document.createElement("canvas"), { width: 256, height: 140 });
+    const ctx = room.getContext("2d");
+    const clamp = (x, low = 0, high = 1) => Math.max(low, Math.min(x, high));
+    const mix = (a, b, t) => a + (b - a) * t;
+    function smooth(a, b, x) {
+      const t = clamp((x - a) / (b - a));
+      return t * t * (3 - 2 * t);
+    }
+    const hash = n => {
+      const x = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+      return x - Math.floor(x);
+    };
+
+    // Scene geometry stays on the pixel grid. The compositing pass moves at display refresh rate.
+    const colors = {
+      wall: ["#e8e1cd", "#29324b"], wallShade: ["#d6d0bd", "#202a43"],
+      cream: ["#f5edda", "#384560"], panel: ["#ddd5b8", "#26334c"],
+      trim: ["#c9bda0", "#1b263f"], deep: ["#555951", "#111a30"],
+      wood: ["#a66b3e", "#252139"], woodLight: ["#c68c53", "#39314c"],
+      woodDark: ["#724a35", "#171a30"], ink: ["#292e3e", "#0e172a"],
+      leaf: ["#647c47", "#243a3a"], leafLight: ["#94a263", "#3b5450"],
+      rug: ["#6c8590", "#303b57"], rugLight: ["#b8c6b5", "#465470"],
+      metal: ["#60677a", "#27334e"], skin: ["#d7a37c", "#655673"],
+      shirt: ["#818d51", "#34435e"], hair: ["#272938", "#11182c"],
+      hairLight: ["#464a53", "#25324b"], paper: ["#f4e7be", "#6e6c7d"],
+      red: ["#ab6253", "#5a405b"], blue: ["#5e7c96", "#364b6d"],
+      quilt: ["#7395a0", "#3f5e7d"], quiltLight: ["#a9c3bc", "#6486a1"],
+      quiltShade: ["#56747d", "#2f4565"], pillow: ["#f4ebd4", "#68798d"],
+      rain: ["#d9edef", "#b1d2ee"], windowSky: ["#aacbd5", "#263b58"],
+      windowMist: ["#c5d6cf", "#405875"], hill: ["#88a38d", "#2b4258"],
+      pine: ["#618263", "#1a2d47"], cloud: ["#edf0e2", "#465971"]
+    };
+    const palette = {};
+    const rgb = hex => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
+    for (const key of Object.keys(colors)) colors[key] = colors[key].map(rgb);
+    let paletteStep = -1;
+    function shade(night) {
+      const step = Math.round(night * 48);
+      if (step === paletteStep) return;
+      paletteStep = step;
+      for (const [key, [day, dark]] of Object.entries(colors)) {
+        palette[key] = "rgb(" + day.map((v, i) => Math.round(mix(v, dark[i], step / 48))).join(",") + ")";
+      }
+    }
+    function rect(x, y, w, h, color) {
+      if (w <= 0 || h <= 0) return;
+      ctx.fillStyle = palette[color] ?? color;
+      ctx.fillRect(Math.round(x), Math.round(y), Math.ceil(w), Math.ceil(h));
+    }
+    function poly(points, color) {
+      ctx.fillStyle = palette[color] ?? color;
+      ctx.beginPath();
+      for (const [i, [x, y]] of points.entries()) {
+        if (i === 0) ctx.moveTo(Math.round(x), Math.round(y));
+        else ctx.lineTo(Math.round(x), Math.round(y));
+      }
+      ctx.closePath();
+      ctx.fill();
+    }
+    function oval(x, y, rx, ry, color) {
+      for (let dy = -ry; dy <= ry; dy++) {
+        const span = Math.floor(rx * Math.sqrt(1 - (dy / (ry + .5)) ** 2));
+        rect(x - span, y + dy, span * 2 + 1, 1, color);
+      }
+    }
+    function plant(x, y, size) {
+      rect(x - 2, y - 7, 1, 6, "leaf");
+      rect(x + 2, y - 9, 1, 8, "leaf");
+      oval(x - 3, y - 8, size, size - 1, "leaf");
+      oval(x + 2, y - 11, size, size, "leaf");
+      oval(x + 2, y - 12, size - 1, size - 1, "leafLight");
+      oval(x + 6, y - 7, size - 1, size - 1, "leaf");
+      rect(x - 4, y - 3, 10, 2, "red");
+      rect(x - 3, y - 1, 8, 5, "red");
+      rect(x - 2, y, 2, 3, "woodLight");
+    }
+    function paintRoom(time, scene) {
+      const { night, rain, lamp, screen, lie, cover } = scene;
+      shade(night);
+      const left = (192 - room.width) / 2;
+      ctx.setTransform(1, 0, 0, 1, -left, 14);
+      rect(left, -14, room.width, room.height, "wall");
+      rect(left, -14, room.width, 22, "wallShade");
+      rect(left, 5, room.width, 1, "trim");
+      rect(left, 7, room.width, 1, "cream");
+      rect(left, 75, room.width, 20, "panel");
+      rect(left, 73, room.width, 2, "cream");
+      rect(left, 75, room.width, 1, "trim");
+      for (let x = left + 2; x < left + room.width; x += 8) {
+        rect(x, 77, 1, 16, "trim");
+        rect(x + 1, 77, 1, 16, "cream");
+      }
+      rect(left, 92, room.width, 3, "trim");
+      rect(left, 95, room.width, 2, "woodDark");
+      rect(left, 97, room.width, 29, "wood");
+      for (let row = 0, y = 97; y < 126; row++, y += row < 3 ? 3 : 5) {
+        rect(left, y, room.width, 1, "woodDark");
+        for (let col = -2; col < 14; col++) {
+          const x = col * 17 + (row % 3) * 6;
+          rect(x, y + 1, 1, row < 3 ? 2 : 4, "woodDark");
+          rect(x + 3 + hash(col + row * 17) * 3, y + 1, 5, 1, "woodLight");
+        }
+      }
+      paintWindow(time, night, rain);
+      rect(92, 25, 17, 13, "wallShade");
+      rect(91, 23, 17, 13, "woodDark");
+      rect(92, 24, 15, 11, "paper");
+      rect(94, 26, 11, 7, "blue");
+      poly([[94, 33], [98, 27], [103, 32], [105, 29], [105, 33]], "leaf");
+      rect(95, 27, 2, 1, "cream");
+      oval(82, 104, 48, 8, "woodDark");
+      oval(82, 103, 46, 7, "rug");
+      oval(82, 103, 40, 5, "rugLight");
+      oval(82, 103, 36, 4, "rug");
+      for (let x = 50; x < 116; x += 5) {
+        rect(x, 104, 2, 1, "rugLight");
+        rect(x + 2, 105, 2, 1, "rugLight");
+      }
+
+      ctx.save();
+      ctx.translate(-159, 0);
+      paintShelf();
+      ctx.restore();
+      ctx.save();
+      ctx.translate(-46, 0);
+      if (lamp > 0) {
+        ctx.globalAlpha = lamp * .25;
+        poly([[144, 56], [155, 56], [168, 74], [127, 74]], "#eab36c");
+        ctx.globalAlpha = lamp * .4;
+        poly([[144, 56], [153, 56], [163, 71], [134, 71]], "#f9c27c");
+        ctx.globalAlpha = 1;
+      }
+      rect(70, 72, 3, 25, "woodDark");
+      rect(70, 74, 1, 22, "woodLight");
+      rect(135, 72, 20, 26, "woodDark");
+      rect(137, 74, 15, 22, "wood");
+      for (let y = 75; y < 96; y += 7) {
+        rect(138, y, 13, 5, "woodLight");
+        rect(143, y + 2, 4, 1, "woodDark");
+      }
+      rect(68, 69, 90, 4, "woodDark");
+      rect(68, 69, 90, 1, "woodLight");
+      if (lamp > 0) {
+        ctx.globalAlpha = lamp;
+        rect(133, 69, 25, 1, "#f3ba72");
+        rect(141, 70, 12, 1, "#bd8956");
+        ctx.globalAlpha = 1;
+      }
+      paintMonitor(time, screen);
+      rect(146, 67, 10, 2, "ink");
+      rect(151, 56, 2, 11, "metal");
+      poly([[151, 60], [151, 54], [146, 51], [144, 52], [149, 55], [150, 60]], "metal");
+      poly([[144, 51], [150, 51], [153, 55], [141, 55]], "ink");
+      rect(143, 52, 6, 1, "metal");
+      if (lamp > 0) {
+        ctx.globalAlpha = lamp;
+        rect(142, 55, 10, 1, "#ffd78c");
+        ctx.globalAlpha = 1;
+      }
+
+      rect(75, 67, 6, 2, "ink");
+      paintMug(84, 65, time, screen > .65);
+      ctx.restore();
+
+      ctx.save();
+      ctx.translate(-8, 0);
+      paintChair();
+      ctx.restore();
+      ctx.save();
+      ctx.translate(10, 0);
+      paintBed();
+      ctx.restore();
+      paintPerson(time, scene);
+      ctx.save();
+      ctx.translate(10, 0);
+      paintQuilt(time, lie, cover);
+      ctx.restore();
+    }
+
+    function paintWindow(time, night, rain) {
+      ctx.save();
+      ctx.translate(113, -1);
+      rect(16, 17, 49, 51, "wallShade");
+      rect(18, 18, 45, 47, "cream");
+      ctx.beginPath();
+      ctx.rect(21, 21, 39, 41);
+      ctx.clip();
+      rect(21, 21, 39, 41, "windowSky");
+      rect(21, 37, 39, 25, "windowMist");
+      const cloudX = 20 + time * .75 % 46;
+      ctx.globalAlpha = .9 * (1 - rain);
+      rect(cloudX, 27, 13, 2, "cloud");
+      rect(cloudX + 3, 25, 6, 2, "cloud");
+      rect(54 - time * .42 % 38, 34, 10, 1, "cloud");
+      ctx.globalAlpha = 1;
+      poly([[19, 52], [32, 40], [37, 40], [50, 48], [58, 44], [63, 49], [63, 62], [19, 62]], "hill");
+      rect(21, 56, 39, 6, "pine");
+      for (const [x, y, size] of [[25, 48, 5], [31, 53, 4], [54, 45, 6], [59, 52, 4]]) {
+        poly([[x, y], [x - size, y + 12], [x + size, y + 12]], "pine");
+        rect(x, y + 7, 1, 8, "pine");
+      }
+      rect(42, 54, 8, 6, "wallShade");
+      poly([[40, 55], [44, 51], [48, 51], [52, 55]], "red");
+      rect(45, 56, 2, 2, night > .55 ? "#d2a974" : "blue");
+      if (rain > 0) {
+        for (let i = 0; i < 24; i++) {
+          const fall = (hash(i + 4) * 49 + time * (15 + hash(i + 20) * 23)) % 49;
+          const x = 20 + Math.floor(hash(i + 80) * 43) - Math.floor(fall / 15);
+          const y = 17 + fall;
+          const length = 2 + Math.floor(hash(i) * 5);
+          ctx.globalAlpha = rain * (.31 + hash(i + 140) * .46);
+          rect(x, y, 1, length - 1, "rain");
+          rect(x - 1, y + length - 1, 1, 2, "rain");
+        }
+      }
+      ctx.globalAlpha = .16;
+      poly([[21, 23], [35, 21], [43, 21], [21, 29]], "rain");
+      ctx.globalAlpha = 1;
+      rect(39, 21, 2, 41, "trim");
+      rect(40, 21, 1, 41, "cream");
+      rect(21, 42, 39, 2, "cream");
+      rect(21, 44, 39, 1, "trim");
+      ctx.restore();
+      rect(118, 62, 50, 2, "cream");
+      rect(119, 64, 48, 2, "trim");
+      plant(125, 59, 2);
+    }
+
+    function paintShelf() {
+      rect(163, 29, 25, 68, "woodDark");
+      rect(165, 31, 21, 63, "wallShade");
+      for (let row = 0; row < 4; row++) {
+        const base = 45 + row * 16;
+        rect(162, base, 27, 2, "woodLight");
+        rect(162, base + 2, 27, 1, "woodDark");
+        if (row === 1) continue;
+        let x = 166;
+        for (let book = 0; book < 5; book++) {
+          const tall = 7 + Math.floor(hash(book + row * 12) * 7);
+          const color = ["blue", "red", "leaf", "paper", "metal"][(book + row * 2) % 5];
+          rect(x, base - tall, 3, tall, color);
+          rect(x, base - tall + 2, 3, 1, "paper");
+          rect(x + 2, base - tall + 3, 1, tall - 3, "woodDark");
+          x += 4;
+        }
+      }
+      rect(162, 29, 2, 69, "woodLight");
+      rect(187, 29, 2, 69, "woodLight");
+      rect(162, 28, 27, 2, "woodLight");
+      rect(166, 54, 6, 6, "paper");
+      rect(166, 53, 6, 1, "red");
+      oval(180, 57, 5, 3, "blue");
+      rect(179, 52, 3, 3, "metal");
+      rect(183, 54, 3, 1, "cream");
+      plant(173, 25, 5);
+      rect(183, 18, 1, 15, "leaf");
+      rect(184, 22, 2, 2, "leafLight");
+      rect(181, 26, 2, 3, "leaf");
+      rect(184, 31, 2, 3, "leaf");
+    }
+
+    function paintMonitor(time, screen) {
+      rect(110, 46, 28, 18, "ink");
+      rect(111, 47, 26, 1, "metal");
+      rect(112, 48, 24, 13, "#172033");
+      rect(122, 64, 3, 4, "metal");
+      rect(117, 68, 14, 1, "ink");
+      ctx.globalAlpha = screen;
+      rect(112, 48, 24, 13, "#263d51");
+      rect(114, 50, 1, 8, "#7c9ab0");
+      rect(117, 50, 9, 1, "#dfb68b");
+      rect(117, 52, 4, 1, "#7cbeb9");
+      rect(123, 52, 8, 1, "#a9bccb");
+      rect(119, 54, 11, 1, "#849dcc");
+      const typing = reducedMotion.matches ? 6 : Math.floor(time * 9) % 10;
+      rect(120, 56, typing, 1, "#d8d8a1");
+      if (time % 1 < .6) rect(120 + typing, 56, 1, 2, "#ecf3d6");
+      rect(135, 62, 1, 1, "#8bc6b0");
+      ctx.globalAlpha = 1;
+    }
+    function paintSteam(x, y, time) {
+      if (reducedMotion.matches) return;
+      for (let i = 0; i < 3; i++) {
+        const drift = (time * 2.5 + i * 2.3) % 7;
+        ctx.globalAlpha = (1 - drift / 8) * .66;
+        rect(x + Math.sin(drift * .6 + i), y - drift, 1, 1, "cream");
+      }
+      ctx.globalAlpha = 1;
+    }
+    function paintMug(x, y, time, steam) {
+      rect(x + 4, y + 1, 2, 2, "paper");
+      rect(x, y, 4, 4, "cream");
+      rect(x + 1, y, 3, 1, "woodDark");
+      if (steam) paintSteam(x + 2, y - 1, time);
+    }
+
+    function paintChair() {
+      rect(51, 82, 15, 3, "ink");
+      rect(57, 85, 3, 11, "metal");
+      rect(51, 96, 15, 1, "ink");
+      rect(51, 97, 2, 2, "ink");
+      rect(65, 97, 2, 2, "ink");
+      rect(49, 71, 11, 12, "metal");
+      rect(50, 72, 9, 8, "blue");
+      rect(50, 72, 8, 1, "rug");
+    }
+
+    function paintBed() {
+      oval(142, 94, 32, 3, "woodDark");
+      rect(168, 66, 6, 28, "woodDark");
+      rect(169, 67, 3, 16, "wood");
+      rect(169, 66, 4, 1, "woodLight");
+      rect(112, 86, 61, 6, "woodDark");
+      rect(113, 91, 3, 5, "woodDark");
+      rect(168, 91, 3, 4, "woodDark");
+      rect(112, 87, 61, 2, "woodLight");
+      poly([[109, 79], [114, 73], [170, 73], [172, 80], [171, 87], [110, 87]], "pillow");
+      rect(110, 84, 61, 2, "trim");
+      poly([[148, 78], [151, 72], [166, 71], [169, 74], [167, 79], [152, 80]], "pillow");
+      rect(152, 73, 14, 2, "cream");
+      rect(154, 78, 11, 1, "trim");
+      poly([[110, 80], [115, 74], [139, 74], [144, 78], [142, 90], [110, 89]], "quiltShade");
+      poly([[110, 80], [115, 74], [139, 74], [143, 78], [141, 86], [110, 85]], "quilt");
+      rect(115, 75, 23, 1, "quiltLight");
+      rect(111, 84, 29, 1, "quiltLight");
+    }
+
+    function paintQuilt(time, lie, cover) {
+      if (cover <= 0) return;
+      const edge = mix(116, 149, cover);
+      const breath = lie === 1 && !reducedMotion.matches && Math.sin(time * 1.9) > .48 ? 1 : 0;
+      poly([[109, 80], [114, 74], [edge - 12, 74 - breath], [edge - 4, 71 - breath], [edge, 73],
+        [edge + 1, 78], [edge - 3, 89], [110, 89]], "quiltShade");
+      poly([[109, 80], [115, 75], [edge - 12, 74 - breath], [edge - 4, 71 - breath], [edge, 73],
+        [edge - 1, 78], [edge - 4, 85], [110, 85]], "quilt");
+      rect(113, 83, edge - 120, 1, "quiltLight");
+      poly([[edge - 5, 72 - breath], [edge - 3, 71 - breath], [edge, 73], [edge - 1, 78],
+        [edge - 4, 85], [edge - 6, 84], [edge - 3, 77]], "quiltLight");
+    }
+
+    function limb(a, b, width, color) {
+      const dx = b[0] - a[0];
+      const dy = b[1] - a[1];
+      const length = Math.hypot(dx, dy) || 1;
+      const nx = -dy / length * width / 2;
+      const ny = dx / length * width / 2;
+      poly([[a[0] + nx, a[1] + ny], [b[0] + nx, b[1] + ny],
+        [b[0] - nx, b[1] - ny], [a[0] - nx, a[1] - ny]], color);
+    }
+
+    function walkFoot(cycle) {
+      const phase = cycle % 1;
+      // While planted, the foot travels backward at the same rate the hips advance.
+      if (phase < .6) return [mix(4.5, -4.5, phase / .6), 0];
+      const swing = (phase - .6) / .4;
+      return [mix(-4.5, 4.5, smooth(0, 1, swing)), Math.sin(swing * Math.PI) * 4];
+    }
+
+    function paintPerson(time, { rise, travel, perch, lie, stride, facing }) {
+      const cycle = (facing > 0 ? travel : 1 - travel) * 4.8;
+      const bob = (1 - Math.cos(cycle * Math.PI * 4)) * .45 * stride;
+      const armSwing = Math.sin(cycle * Math.PI * 2) * 3.2 * stride * facing;
+      const lean = facing * stride * 1.5;
+      const x = 50 + 72 * travel + 7 * perch + 18 * lie;
+      const y = Math.round(82 - 7 * rise + 4 * perch - 2 * lie - bob);
+      if (stride > 0) oval(x, 99, 6, 1, "woodDark");
+      ctx.save();
+      ctx.translate(Math.round(x), Math.round(y));
+      ctx.rotate(lie * Math.PI / 2);
+      const seated = (1 - rise) + perch * (1 - lie);
+      const legReach = mix(98 - y, 15, lie);
+      for (const side of [-1, 1]) {
+        const [footLead, lift] = walkFoot(cycle + (side === 1 ? .5 : 0));
+        const hip = [side * 1.5, 0];
+        const ankle = [
+          mix(side * 2.5 + seated * 6, footLead * facing + side, stride),
+          mix(legReach, 14, seated) - (side === -1 ? 1 : 0) - lift * stride
+        ];
+        const knee = [
+          mix(side * 2 + seated * 7, (hip[0] + ankle[0]) / 2 + facing * (1.3 + lift * .35), stride),
+          mix(ankle[1] * .49, 3, seated)
+        ];
+        const fabric = side === 1 ? "metal" : "ink";
+        limb(hip, knee, 4.6, fabric);
+        limb(knee, ankle, 3.5, fabric);
+        rect(ankle[0] - (facing < 0 && stride > .1 ? 4 : 1), ankle[1] - 1, 5, 2, "ink");
+      }
+      const typing = rise === 0 && !reducedMotion.matches ? Math.round(Math.sin(time * 20)) : 0;
+      const hand = [mix(15, 4 - armSwing, rise), mix(-14 + typing, -3, rise)];
+      const elbow = [mix(7, lean + armSwing * .45, stride), -9];
+      limb([lean + 3, -13], elbow, 4, "leaf");
+      limb(elbow, hand, 2.4, "skin");
+      const shoulder = mix(5.5, 3.8, stride);
+      poly([[lean - shoulder, -15], [lean + shoulder, -15], [lean + shoulder + 1, -12],
+        [3.5, 1], [-4.5, 1], [lean - shoulder - 1, -12]], "shirt");
+      rect(lean - shoulder, -11, 1, 10, "leaf");
+      rect(lean - shoulder + 1, -15, shoulder * 2 - 1, 1, "leafLight");
+      if (stride > 0) {
+        const nearElbow = [lean + armSwing * .65 - facing, -8];
+        limb([lean, -13], nearElbow, 3.5, "leafLight");
+        limb(nearElbow, [lean + armSwing + facing, -3], 2.4, "skin");
+      }
+      rect(lean - 2, -18, 5, 4, "skin");
+      const profile = travel > 0 || rise > .65;
+      rect(lean - 4, -26, 8, 8, "hair");
+      rect(lean - 3, -27, 6, 2, "hair");
+      rect(lean - 2, -26, 4, 1, "hairLight");
+      if (profile) {
+        const face = lie > 0 ? 1 : facing;
+        rect(lean + (face > 0 ? 1 : -5), -23, 4, 5, "skin");
+        rect(lean + face * 5, -21, 1, 2, "skin");
+        if (lie < .96) rect(lean + face * 3, -22, 1, 1, "ink");
+      } else {
+        rect(-5, -23, 1, 3, "skin");
+        rect(4, -23, 1, 3, "skin");
+      }
+      ctx.restore();
+      if (lie >= .96) rect(x + 19, y + 3, 2, 1, "ink");
+      if (rise < .85) {
+        rect(41, 72, 10, 10, "metal");
+        rect(42, 73, 8, 6, "blue");
+        rect(42, 73, 8, 1, "rug");
+      }
+    }
+
+    const fragment = `#version 300 es
+      precision highp float;
+      uniform sampler2D uRoom;
+      uniform vec2 uSize;
+      uniform vec2 uLens;
+      uniform vec2 uStretch;
+      uniform float uNight;
+      uniform float uLamp;
+      uniform float uScreen;
+      uniform float uLift;
+      out vec4 pixel;
+
+      float capsule(vec2 p, float radius) {
+        p.x -= clamp(p.x, -${lensTravel.toFixed(1)}, ${lensTravel.toFixed(1)});
+        return length(p) - radius;
+      }
+      vec3 scene(vec2 p) {
+        vec2 size = vec2(${room.width.toFixed(1)}, ${room.height.toFixed(1)});
+        return texture(uRoom, p / size + .5).rgb;
+      }
+      float glow(vec2 p, vec2 center, vec2 spread) {
+        vec2 q = (p - center) / spread;
+        return exp(-dot(q, q));
+      }
+      vec3 illumination(vec2 p) {
+        float amber = uLamp * glow(p, vec2(10.0, 7.0), vec2(22.0, 19.0));
+        float screen = uScreen * glow(p, vec2(-26.0, -2.0), vec2(19.0, 14.0));
+        float window = uNight * glow(p, vec2(57.0, 1.0), vec2(30.0, 28.0));
+        return vec3(.26, .138, .043) * amber + vec3(.038, .068, .12) * screen
+          + vec3(.052, .083, .135) * window;
+      }
+      void main() {
+        vec2 p = (gl_FragCoord.xy - uSize * .5) * (${frameWidth.toFixed(1)} / uSize.x);
+        p.y = -p.y;
+        float aa = max(fwidth(p.x), fwidth(p.y)) * .72;
+        float outer = capsule(p, ${trackRadius.toFixed(1)});
+        float inner = capsule(p, ${apertureRadius.toFixed(1)});
+        float shape = 1.0 - smoothstep(-aa, aa, outer);
+        float aperture = 1.0 - smoothstep(-aa, aa, inner);
+        float nearShadow = exp(-pow(max(0.0, capsule(p - vec2(0.0, 2.6), 52.7)) / 3.2, 1.2));
+        float farShadow = exp(-pow(max(0.0, capsule(p - vec2(0.0, 5.8), 51.0)) / 7.0, 1.2));
+        float shadow = (nearShadow * .20 + farShadow * .18) * mix(1.0, .73, uNight);
+        vec2 spine = vec2(clamp(p.x, -${lensTravel.toFixed(1)}, ${lensTravel.toFixed(1)}), 0.0);
+        vec2 normal = normalize(p - spine + vec2(.001));
+        float edgeDepth = clamp(-outer / 4.2, 0.0, 1.0);
+        float bevel = sin(edgeDepth * 3.14159);
+        float lightDir = .54 - .29 * normal.y - .17 * normal.x;
+        vec3 shellDay = mix(vec3(.56, .53, .47), vec3(.99, .966, .89), bevel * .73 + lightDir * .26);
+        vec3 shellNight = vec3(.092, .111, .174) + vec3(.12, .13, .19) * bevel * lightDir;
+        vec3 shell = mix(shellDay, shellNight, uNight);
+        shell += mix(.16, .032, uNight) * exp(-pow((outer + .84) / .55, 2.0)) * lightDir;
+        shell += vec3(.16, .09, .04) * uLamp * glow(p, vec2(14.0, 35.0), vec2(40.0, 25.0));
+        shell += vec3(.055, .082, .13) * uNight * glow(p, vec2(79.0, -39.0), vec2(30.0, 26.0));
+
+        vec2 lensPoint = (p - uLens) / uStretch;
+        float lensRadius = 44.4 + uLift * .55;
+        float distanceToLens = length(lensPoint);
+        float r = distanceToLens / lensRadius;
+        float lens = 1.0 - smoothstep(-aa, aa, distanceToLens - lensRadius);
+        float rim = smoothstep(.68, 1.0, r);
+        vec2 bend = lensPoint * (.806 + .30 * rim + .105 * rim * rim);
+        vec2 q = uLens + bend;
+        vec2 split = lensPoint * .024 * rim;
+        vec3 refracted = vec3(scene(q + split).r, scene(q).g, scene(q - split).b);
+        float lensShadow = exp(-pow(max(0.0, length((p - uLens - vec2(1.1, 2.0 + uLift * 1.8)) / uStretch) - lensRadius) / 2.5, 1.45));
+        vec3 inside = scene(p) * (1.0 - lensShadow * mix(.23, .38, uLift));
+        inside += illumination(p);
+        refracted += illumination(q);
+        vec2 n = lensPoint / max(distanceToLens, .01);
+        float softbox = glow(lensPoint, vec2(-11.0, -31.5), vec2(31.0, 6.0));
+        float caustic = exp(-pow((r - .89) / .059, 2.0)) * smoothstep(.28, .97, n.y);
+        refracted *= 1.0 - .35 * smoothstep(.945, 1.018, r);
+        refracted += vec3(1.0, .96, .87) * (softbox * mix(.14, .045, uNight) + caustic * mix(.19, .052, uNight));
+        inside = mix(inside, refracted, lens);
+        inside *= 1.0 - mix(.35, .45, uNight) * exp(min(0.0, inner) / mix(2.2, 4.0, max(0.0, -normal.y)));
+        inside += mix(.038, .011, uNight) * glow(p, vec2(-23.0, -44.0), vec2(70.0, 8.0));
+        vec3 body = mix(shell, inside, aperture);
+        float noise = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - .5;
+        body += noise * .005;
+        vec3 shadowColor = mix(vec3(.24, .19, .125), vec3(.012, .017, .042), uNight);
+        float alpha = shape + (1.0 - shape) * shadow;
+        vec3 result = mix(shadowColor, body, shape / max(alpha, .0001));
+        pixel = vec4(result, alpha);
+      }
+    `;
+
+    function createRenderer(canvas) {
+      const gl = canvas.getContext("webgl2", { alpha: true, premultipliedAlpha: false, antialias: false });
+      if (!gl) return null;
+      const vertex = `#version 300 es
+        void main() {
+          const vec2 quad[3] = vec2[3](vec2(-1., -1.), vec2(3., -1.), vec2(-1., 3.));
+          gl_Position = vec4(quad[gl_VertexID], 0., 1.);
+        }`;
+      const program = gl.createProgram();
+      for (const [type, source] of [[gl.VERTEX_SHADER, vertex], [gl.FRAGMENT_SHADER, fragment]]) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) throw Error(gl.getShaderInfoLog(shader));
+        gl.attachShader(program, shader);
+      }
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw Error(gl.getProgramInfoLog(program));
+      gl.useProgram(program);
+      const texture = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      const uniform = {};
+      for (const name of ["uSize", "uLens", "uStretch", "uNight", "uLamp", "uScreen", "uLift", "uRoom"]) {
+        uniform[name] = gl.getUniformLocation(program, name);
+      }
+      gl.uniform1i(uniform.uRoom, 0);
+      return (scene, lensX, lift, squash, updateTexture) => {
+        if (updateTexture) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, room);
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.uniform2f(uniform.uSize, canvas.width, canvas.height);
+        gl.uniform2f(uniform.uLens, lensX, 0);
+        gl.uniform2f(uniform.uStretch, 1 + squash * .12, 1 - squash * .05);
+        gl.uniform1f(uniform.uNight, scene.night);
+        gl.uniform1f(uniform.uLamp, scene.lamp);
+        gl.uniform1f(uniform.uScreen, scene.screen);
+        gl.uniform1f(uniform.uLift, lift);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      };
+    }
+
+    function render2D({ night }, lensX, lift, squash) {
+      const out = fallback.getContext("2d");
+      const scale = fallback.width / frameWidth;
+      const trackHalfWidth = lensTravel + trackRadius;
+      const apertureHalfWidth = lensTravel + apertureRadius;
+      out.resetTransform();
+      out.clearRect(0, 0, fallback.width, fallback.height);
+      out.setTransform(scale, 0, 0, scale, fallback.width / 2, fallback.height / 2);
+      out.imageSmoothingEnabled = false;
+      out.beginPath();
+      out.roundRect(-trackHalfWidth, -trackRadius, trackHalfWidth * 2, trackRadius * 2, trackRadius);
+      out.shadowColor = "rgba(35,25,20,.32)";
+      out.shadowBlur = 7 * scale;
+      out.shadowOffsetY = 3 * scale;
+      out.fillStyle = night > .55 ? "#202a44" : "#e8e0cd";
+      out.fill();
+      out.shadowColor = "transparent";
+      out.save();
+      out.beginPath();
+      out.roundRect(-apertureHalfWidth, -apertureRadius, apertureHalfWidth * 2, apertureRadius * 2, apertureRadius);
+      out.clip();
+      out.drawImage(room, -room.width / 2, -room.height / 2);
+      out.translate(lensX, 0);
+      out.scale(1 + squash * .12, 1 - squash * .05);
+      out.beginPath();
+      out.arc(0, 0, 44.4 + lift * .55, 0, Math.PI * 2);
+      out.clip();
+      out.drawImage(room, (-room.width / 2 - lensX) * 1.24, -room.height * .62, room.width * 1.24, room.height * 1.24);
+      const glass = out.createRadialGradient(-8, -10, 20, 0, 0, 45);
+      glass.addColorStop(0, "transparent");
+      glass.addColorStop(.91, night > .55 ? "#b1bcde20" : "#ffffec55");
+      glass.addColorStop(1, "#262c3c70");
+      out.fillStyle = glass;
+      out.fillRect(-46, -46, 92, 92);
+      out.restore();
+    }
+
+    let renderer;
+    try {
+      renderer = createRenderer(view);
+    } catch (error) {
+      console.warn("Using the Canvas 2D renderer", error.message);
+    }
+    function activateFallback() {
+      renderer = render2D;
+      fallback.hidden = false;
+      view.hidden = true;
+    }
+    if (!renderer) activateFallback();
+    view.addEventListener("webglcontextlost", event => {
+      event.preventDefault();
+      activateFallback();
+      invalidate();
+    });
+
+    // The switch has two committed endpoints and a continuous, independently rendered position.
+    let position = 0;
+    let target = 0;
+    let velocity = 0;
+    let settleRate = 9.5;
+    let facing = 1;
+    let press = null;
+    let lift = 0;
+    let squash = 0;
+    let squashSpeed = 0;
+    let frame = 0;
+    let lastFrame = 0;
+    let lastPaint = -Infinity;
+    let visualTime = 0;
+    let lastNight = -1;
+    let lastLamp = -1;
+    let scene = null;
+
+    function readScene() {
+      const night = smooth(.19, .96, position);
+      const rain = smooth(.69, .9, position);
+      const lamp = (.19 + .62 * smooth(.14, .47, position)) * (1 - smooth(.71, .92, position));
+      const screen = 1 - smooth(.13, .29, position);
+      const rise = smooth(.12, .29, position);
+      const travel = smooth(.27, .7, position);
+      const perch = smooth(.69, .79, position);
+      const lie = smooth(.79, .96, position);
+      const cover = smooth(.84, .99, position);
+      const stride = smooth(.27, .37, position) * (1 - smooth(.61, .71, position));
+      return { night, rain, lamp, screen, rise, travel, perch, lie, cover, stride, facing };
+    }
+    function resize() {
+      const { width, height } = control.parentElement.getBoundingClientRect();
+      const dpr = Math.min(devicePixelRatio || 1, 2);
+      for (const canvas of [view, fallback]) {
+        canvas.width = Math.max(1, Math.round(width * dpr));
+        canvas.height = Math.max(1, Math.round(height * dpr));
+      }
+      invalidate();
+    }
+    function schedule() {
+      if (!frame && !document.hidden) frame = requestAnimationFrame(tick);
+    }
+    function invalidate() {
+      lastPaint = -Infinity;
+      schedule();
+    }
+    function tick(now) {
+      frame = 0;
+      const dt = lastFrame ? Math.min((now - lastFrame) / 1000, .04) : 1 / 60;
+      lastFrame = now;
+      const reduce = reducedMotion.matches;
+      if (!reduce) visualTime += dt;
+      let landed = false;
+      if (press && press.moved) {
+        const previous = position;
+        position = mix(position, target, 1 - Math.exp(-dt * 36));
+        velocity = (position - previous) / dt;
+      } else if (position !== target || velocity !== 0) {
+        const omega = reduce ? 20 : settleRate;
+        const offset = position - target;
+        const rate = velocity + omega * offset;
+        const decay = Math.exp(-omega * dt);
+        position = clamp(target + (offset + rate * dt) * decay);
+        velocity = (velocity - omega * rate * dt) * decay;
+        if (Math.abs(position - target) < .001 && Math.abs(velocity) < .025) {
+          position = target;
+          velocity = 0;
+          landed = true;
+        }
+      }
+      if (Math.abs(velocity) > .03) facing = Math.sign(velocity);
+      lift = reduce ? 0 : mix(lift, press ? 1 : 0, 1 - Math.exp(-dt * 15));
+      const desiredSquash = reduce ? 0 : clamp(Math.abs(velocity) * .44, 0, 1.35);
+      if (reduce) {
+        squash = 0;
+        squashSpeed = 0;
+      } else {
+        // Integrate in two short steps so the elastic shape stays stable at low refresh rates.
+        for (let i = 0; i < 2; i++) {
+          squashSpeed += (165 * (desiredSquash - squash) - 11 * squashSpeed) * dt / 2;
+          squash += squashSpeed * dt / 2;
+        }
+      }
+      const moving = position !== target || velocity !== 0;
+      const updateRoom = !scene || landed || now - lastPaint >= 32 || reduce && (moving || press);
+      if (updateRoom) {
+        scene = readScene();
+        paintRoom(visualTime, scene);
+        lastPaint = now;
+        const night = Math.round(scene.night * 1000) / 10;
+        const lamp = Math.round(scene.lamp * scene.night * 100) / 100;
+        if (night !== lastNight) root.style.setProperty("--night", night + "%");
+        if (lamp !== lastLamp) root.style.setProperty("--lamp", lamp);
+        lastNight = night;
+        lastLamp = lamp;
+      }
+      renderer(scene, mix(-lensTravel, lensTravel, position), lift, squash, updateRoom);
+      if (moving || press || !reduce) schedule();
+      else lastFrame = 0;
+    }
+
+    function commit(next, speed = 0) {
+      settleRate = mix(10, 4.6, Math.abs(next - position));
+      target = next;
+      velocity = clamp(speed, -3, 3);
+      const value = String(next === 1);
+      if (control.getAttribute("aria-checked") !== value) {
+        control.setAttribute("aria-checked", value);
+        control.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+      invalidate();
+    }
+    const checked = () => control.getAttribute("aria-checked") === "true";
+    control.addEventListener("pointerdown", event => {
+      if (press || !event.isPrimary || event.button !== 0) return;
+      const width = control.getBoundingClientRect().width;
+      press = { id: event.pointerId, x: event.clientX, start: position, travel: width * lensTravel / (lensTravel + trackRadius),
+        time: event.timeStamp, speed: 0, moved: false, previous: position };
+      control.setPointerCapture(event.pointerId);
+      schedule();
+    });
+    control.addEventListener("pointermove", event => {
+      if (!press || press.id !== event.pointerId) return;
+      const distance = event.clientX - press.x;
+      if (!press.moved) {
+        if (Math.abs(distance) < 4) return;
+        press.moved = true;
+      }
+      const next = clamp(press.start + distance / press.travel);
+      const elapsed = Math.max(.008, (event.timeStamp - press.time) / 1000);
+      press.speed = mix(press.speed, clamp((next - press.previous) / elapsed, -5, 5), .52);
+      press.previous = next;
+      press.time = event.timeStamp;
+      target = next;
+      schedule();
+    });
+    control.addEventListener("pointerup", event => {
+      if (!press || press.id !== event.pointerId) return;
+      const { moved, speed, time } = press;
+      press = null;
+      if (!moved) {
+        commit(checked() ? 0 : 1);
+        return;
+      }
+      const releaseSpeed = event.timeStamp - time < 95 ? clamp(speed, -3, 3) : 0;
+      commit(target + releaseSpeed * .09 >= .5 ? 1 : 0, releaseSpeed);
+    });
+    function cancelPress(event) {
+      if (!press || press.id !== event.pointerId) return;
+      press = null;
+      commit(checked() ? 1 : 0);
+    }
+    control.addEventListener("pointercancel", cancelPress);
+    control.addEventListener("lostpointercapture", cancelPress);
+    control.addEventListener("click", event => {
+      if (event.detail === 0) commit(checked() ? 0 : 1);
+    });
+    control.addEventListener("keydown", event => {
+      if (["ArrowLeft", "ArrowDown", "Home"].includes(event.key)) {
+        event.preventDefault();
+        commit(0);
+      } else if (["ArrowRight", "ArrowUp", "End"].includes(event.key)) {
+        event.preventDefault();
+        commit(1);
+      }
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        cancelAnimationFrame(frame);
+        frame = 0;
+        lastFrame = 0;
+      } else {
+        invalidate();
+      }
+    });
+    reducedMotion.addEventListener("change", invalidate);
+    new ResizeObserver(resize).observe(control.parentElement);
+    resize();
+  </script>
+</body>
+</html>

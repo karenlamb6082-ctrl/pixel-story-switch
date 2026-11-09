@@ -1,0 +1,4 @@
+interface:
+  display_name: "Pixel Story Switch"
+  short_description: "Build draggable pixel-art story switches"
+  default_prompt: "Use $pixel-story-switch to turn a day-to-night scene into a draggable pixel-art story switch."
